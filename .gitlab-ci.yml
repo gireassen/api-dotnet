@@ -1,0 +1,31 @@
+stages: [test, build, security, deploy]
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^prod-.*$/'
+      variables:
+        ENV_NAME: "prod"
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      variables:
+        ENV_NAME: "stage"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      variables:
+        ENV_NAME: "dev"
+    - when: always
+
+include:
+  - project: "platform/ci-templates"
+    ref: "main"
+    file:
+      - "templates/_rules.yml"
+      - "templates/_variables.yml"
+      - "templates/test-dotnet.yml"
+      - "templates/build-image.yml"
+      - "templates/security.yml"
+      - "templates/gitops-update.yml"
+
+variables:
+  APP_NAME: "api-dotnet"
+  GITOPS_REPO: "gitops/cluster-config"
+  IMAGE_NAME: "${REGISTRY_HOST}/${CI_PROJECT_PATH}"
+  DOTNET_SDK_TAG: "8.0"

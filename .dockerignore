@@ -1,0 +1,11 @@
+**/bin
+**/obj
+.git
+.gitlab
+.vscode
+.idea
+*.user
+*.suo
+*.cache
+*.log
+**/.vs/
