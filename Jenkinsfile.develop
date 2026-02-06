@@ -1,0 +1,99 @@
+pipeline {
+  agent { label 'label' }
+
+  options {
+    timeout(time: 20, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    timestamps()
+  }
+
+  environment {
+    TG_TOKEN_CRED = "tg-bot-token"
+    TG_CHATID_CRED = "tg-chat-id"
+    FAIL_REASON = ""
+    IMAGE_NAME = "api-dotnet"
+  }
+
+  stages {
+    stage('Checkout') { steps { checkout scm } }
+
+    stage('Init tag') {
+      steps {
+        script {
+          def sha = sh(script: "git rev-parse --short=12 HEAD", returnStdout: true).trim()
+          env.TAG = "dev-${sha}"
+          env.IMAGE = "${env.IMAGE_NAME}:${env.TAG}"
+          writeFile(file: "image.info", text: "${env.IMAGE}\n")
+          echo "IMAGE=${env.IMAGE}"
+        }
+      }
+    }
+
+    stage('Build image') {
+      steps {
+        sh "docker build -t ${env.IMAGE} ."
+      }
+    }
+
+    stage('Scan image (Trivy)') {
+      steps {
+        script {
+          try {
+            sh """
+              docker run --rm \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                aquasec/trivy:latest image \
+                  --severity HIGH,CRITICAL \
+                  --exit-code 1 \
+                  ${env.IMAGE}
+            """
+          } catch (e) {
+            env.FAIL_REASON = "VULNS_FOUND (HIGH/CRITICAL)"
+            throw e
+          }
+        }
+      }
+    }
+
+    stage('Save image to artifact (tar.gz)') {
+      steps {
+        sh "docker save ${env.IMAGE} | gzip -c > image.tar.gz"
+        archiveArtifacts artifacts: "image.tar.gz,image.info", fingerprint: true
+      }
+    }
+
+    stage('Push to Nexus (dry-run)') {
+      steps {
+        echo "DRY RUN: would push ${env.IMAGE} to registry (skipped by requirement)"
+      }
+    }
+  }
+
+  post {
+    success {
+      script {
+        notifyTG("SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}\\nIMAGE: ${env.IMAGE}\\n${env.BUILD_URL}")
+      }
+    }
+    failure {
+      script {
+        def reason = env.FAIL_REASON?.trim()
+        if (!reason) reason = "BUILD_FAILED"
+        notifyTG("FAILURE: ${env.JOB_NAME} #${env.BUILD_NUMBER}\\nREASON: ${reason}\\n${env.BUILD_URL}")
+      }
+    }
+  }
+}
+
+def notifyTG(String text) {
+  withCredentials([
+    string(credentialsId: env.TG_TOKEN_CRED, variable: 'TG_TOKEN'),
+    string(credentialsId: env.TG_CHATID_CRED, variable: 'TG_CHAT')
+  ]) {
+    sh """
+      curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+        -d "chat_id=${TG_CHAT}" \
+        --data-urlencode "text=${text}" >/dev/null
+    """
+  }
+}
