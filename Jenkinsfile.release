@@ -1,0 +1,110 @@
+pipeline {
+  agent { label 'label' }
+
+  options {
+    timeout(time: 20, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    timestamps()
+  }
+
+  environment {
+    TG_TOKEN_CRED = "tg-bot-token"
+    TG_CHATID_CRED = "tg-chat-id"
+    FAIL_REASON = ""
+    DEVELOP_JOB = "api-dotnet-develop"
+    CONTAINER_NAME = "api-dotnet"
+    HOST_PORT = "8987"
+    CONTAINER_PORT = "8080"
+  }
+
+  stages {
+    stage('Guard: tag only') {
+      steps {
+        script {
+          // джоба реально запускается на теге (SCM=api-dotnet и checkout тега) — это сработает:
+          def tag = sh(script: "git describe --tags --exact-match 2>/dev/null || true", returnStdout: true).trim()
+          if (!tag) {
+            currentBuild.result = 'NOT_BUILT'
+            error("Run on git tag only")
+          }
+          env.RELEASE_TAG = tag
+          echo "RELEASE_TAG=${env.RELEASE_TAG}"
+        }
+      }
+    }
+
+    stage('Get image artifact from develop') {
+      steps {
+        // забираем tar.gz + image.info из последней успешной develop-джобы
+        copyArtifacts(projectName: env.DEVELOP_JOB, selector: lastSuccessful(), filter: 'image.tar.gz,image.info', fingerprintArtifacts: true)
+      }
+    }
+
+    stage('Load & retag image') {
+      steps {
+        script {
+          def devImage = readFile('image.info').trim()
+          sh "gunzip -c image.tar.gz | docker load"
+          env.RELEASE_IMAGE = "${devImage.split(':')[0]}:${env.RELEASE_TAG}"
+          sh "docker tag ${devImage} ${env.RELEASE_IMAGE}"
+          echo "RELEASE_IMAGE=${env.RELEASE_IMAGE}"
+        }
+      }
+    }
+
+    stage('Deploy container') {
+      steps {
+        sh """
+          docker rm -f ${env.CONTAINER_NAME} 2>/dev/null || true
+          docker run -d --name ${env.CONTAINER_NAME} -p ${env.HOST_PORT}:${env.CONTAINER_PORT} ${env.RELEASE_IMAGE}
+        """
+      }
+    }
+
+    stage('Verify service (retries)') {
+      steps {
+        script {
+          def ok = false
+          for (int i=1; i<=6; i++) {
+            def code = sh(script: "curl -s -o /dev/null -w '%{http_code}' http://localhost:${env.HOST_PORT}/ || true", returnStdout: true).trim()
+            if (code.isInteger() && code != "000") { ok = true; break }
+            sleep 20
+          }
+          if (!ok) {
+            env.FAIL_REASON = "HEALTHCHECK_FAILED"
+            sh "docker logs --tail=200 ${env.CONTAINER_NAME} || true"
+            error("Container not responding on http://localhost:${env.HOST_PORT}/")
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      script {
+        notifyTG("RELEASE SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}\\nIMAGE: ${env.RELEASE_IMAGE}\\nURL: ${env.BUILD_URL}")
+      }
+    }
+    failure {
+      script {
+        def reason = env.FAIL_REASON?.trim()
+        if (!reason) reason = "RELEASE_FAILED"
+        notifyTG("RELEASE FAILURE: ${env.JOB_NAME} #${env.BUILD_NUMBER}\\nREASON: ${reason}\\nURL: ${env.BUILD_URL}")
+      }
+    }
+  }
+}
+
+def notifyTG(String text) {
+  withCredentials([
+    string(credentialsId: env.TG_TOKEN_CRED, variable: 'TG_TOKEN'),
+    string(credentialsId: env.TG_CHATID_CRED, variable: 'TG_CHAT')
+  ]) {
+    sh """
+      curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+        -d "chat_id=${TG_CHAT}" \
+        --data-urlencode "text=${text}" >/dev/null
+    """
+  }
+}
